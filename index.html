@@ -67,6 +67,10 @@ body {
 .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; padding: 0 4px 14px; }
 .chip { font-size: 12.5px; font-weight: 600; padding: 7px 12px; border-radius: 999px; background: rgba(255,255,255,.66); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); box-shadow: 0 1px 8px rgba(20,40,60,.06); }
 .chip.g { color: #0E6B5C; } .chip.b { color: #8F4040; }
+.assume-row { display: flex; justify-content: center; padding: 0 0 16px; }
+.assume { border: none; background: rgba(255,255,255,.5); color: #6A7585; font-family: inherit; font-size: 12px; font-weight: 600; padding: 7px 14px; border-radius: 999px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; box-shadow: 0 1px 6px rgba(20,40,60,.05); }
+.assume::before { content: "⌂"; font-size: 13px; opacity: .8; }
+.assume.warn { background: rgba(224,131,72,.14); color: #B25E26; }
 
 .banner { display: flex; align-items: center; gap: 9px; background: rgba(255,255,255,.66); backdrop-filter: blur(18px); border-radius: 18px; padding: 12px 15px; margin: 0 0 16px; box-shadow: 0 4px 18px rgba(20,40,60,.07); font-size: 13.5px; font-weight: 600; color: #2A3340; }
 .banner b { color: #0E6B5C; }
@@ -167,6 +171,12 @@ body {
 .sl { margin-bottom: 18px; }
 .sl-head { display: flex; justify-content: space-between; font-size: 14px; font-weight: 600; color: #3A424E; margin-bottom: 8px; }
 .sl input[type=range] { width: 100%; accent-color: #4E9FD6; height: 30px; }
+.indoor-meta { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,.7); border-radius: 14px; padding: 12px 14px; font-size: 13.5px; font-weight: 650; color: #3A424E; margin-bottom: 14px; box-shadow: inset 0 0 0 1px rgba(120,140,165,.12); }
+.indoor-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: #8A94A2; }
+.ctx-label { font-size: 13px; font-weight: 600; color: #5A6472; margin: 2px 2px 8px; }
+.ctx-seg { display: flex; gap: 6px; background: rgba(120,140,165,.1); border-radius: 14px; padding: 4px; margin-bottom: 12px; }
+.ctx-seg button { flex: 1; border: none; background: transparent; font-family: inherit; font-size: 13px; font-weight: 700; color: #7A8494; padding: 10px 4px; border-radius: 11px; cursor: pointer; }
+.ctx-seg button.on { background: #fff; color: #1A1D21; box-shadow: 0 1px 5px rgba(0,0,0,.1); }
 
 .row-tog { display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,.7); border-radius: 16px; padding: 14px 16px; margin-bottom: 10px; box-shadow: inset 0 0 0 1px rgba(120,140,165,.12); }
 .row-tog .rt-t { font-size: 15px; font-weight: 650; }
@@ -231,15 +241,26 @@ button:focus-visible, input:focus-visible { outline: 2px solid #4E9FD6; outline-
     <div class="sheet-grab"></div>
     <div class="sheet-head"><h2>Settings</h2><button class="sheet-x" data-close>✕</button></div>
 
-    <div class="sec-label">Indoor conditions (estimate)</div>
+    <div class="sec-label">Indoor humidity — the input that drives everything</div>
+    <div class="indoor-meta" id="indoorMeta"><span class="indoor-dot"></span><span id="indoorMetaTxt">—</span></div>
+
+    <div class="ctx-label">What's your room doing right now?</div>
+    <div class="ctx-seg" id="ctxSeg">
+      <button data-c="ac">AC on</button>
+      <button data-c="closed">Closed up</button>
+      <button data-c="aired">Just aired</button>
+    </div>
+    <button class="big-btn" id="estimateBtn" style="margin-bottom:16px">↻ Model it from current conditions</button>
+
     <div class="sl">
       <div class="sl-head"><span>Indoor temperature</span><b id="tVal">23°C</b></div>
       <input type="range" id="tSlider" min="10" max="32" step="0.5" value="23">
     </div>
-    <div class="sl">
-      <div class="sl-head"><span>Indoor humidity</span><b id="hVal">55%</b></div>
+    <div class="sl" style="margin-bottom:8px">
+      <div class="sl-head"><span>Indoor humidity — set from a hygrometer</span><b id="hVal">55%</b></div>
       <input type="range" id="hSlider" min="20" max="90" step="1" value="55">
     </div>
+    <p class="fine" style="margin-bottom:4px">Moving the humidity slider counts as a real reading — most accurate short of a sensor. A ¥1,500 hygrometer calibrates this perfectly. HomeKit (below) makes it automatic and continuous.</p>
 
     <div class="sec-label">Alerts</div>
     <div class="row-tog">
@@ -268,6 +289,43 @@ button:focus-visible, input:focus-visible { outline: 2px solid #4E9FD6; outline-
 const MA = 17.62, MB = 243.12;
 const dewPoint = (T, RH) => { const g = Math.log(Math.max(RH,1)/100) + (MA*T)/(MB+T); return (MB*g)/(MA-g); };
 const rhFromDew = (T, Td) => Math.min(100, Math.max(2, 100*Math.exp((MA*Td)/(MB+Td) - (MA*T)/(MB+T))));
+
+/* ───── indoor humidity engine: model · calibrate · measure ─────
+   Dew point is ~conserved across the building envelope, so indoor
+   absolute humidity tracks outdoor — modified hard by what the room
+   is doing. We model indoor DEW POINT from outdoor + room context,
+   then derive indoor RH at the indoor temperature. */
+function modelIndoorRH() {
+  if (!wx) return null;
+  const outDew = wx.current.dew_point_2m;
+  let indoorDew;
+  if (roomContext === "aired")       indoorDew = outDew;                 // open windows → matches outside
+  else if (roomContext === "closed") indoorDew = outDew + 1.0;           // trapped air + cooking/people nudge it up
+  else /* ac */                      indoorDew = Math.min(outDew, 13.0); // AC dehumidifies toward a ~13°C dew-point floor
+  return Math.round(rhFromDew(settings.indoorT, indoorDew));
+}
+function timeAgo(ts) {
+  if (!ts) return "";
+  const m = Math.round((Date.now() - ts) / 60000);
+  if (m < 2) return "just now";
+  if (m < 60) return m + "m ago";
+  const h = Math.round(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.round(h / 24) + "d ago";
+}
+function indoorStale() {
+  if (indoorSource === "sensor") return false;
+  if (indoorSource === "default" || !indoorTs) return true;
+  return (Date.now() - indoorTs) > 12 * 3600 * 1000;
+}
+/* {word, tone, stale} — drives both the settings readout and the home-screen pill */
+function indoorMeta() {
+  if (indoorSource === "sensor") return { word: "live sensor", tone: "#3BB98F", stale: false };
+  if (indoorSource === "default" || !indoorTs) return { word: "rough default · calibrate", tone: "#E08348", stale: true };
+  const src = indoorSource === "hygrometer" ? "you set it" : "modeled";
+  const stale = indoorStale();
+  return { word: `${src} · ${timeAgo(indoorTs)}${stale ? " · update" : ""}`, tone: stale ? "#E08348" : "#3BB98F", stale };
+}
 
 /* ───── verdict engine (all math in °C internally) ───── */
 function scoreConditions(o) {
@@ -327,6 +385,9 @@ const ZUSHI = { name:"Zushi", country:"Japan", lat:35.2956, lon:139.5803 };
 const savedLoc = store.get("owc-loc", null);
 let loc      = savedLoc || ZUSHI;
 let settings = store.get("owc-settings", { indoorT:23, indoorRH:55 });
+let indoorSource = store.get("owc-indoor-source", "default"); // default | modeled | hygrometer | sensor
+let indoorTs     = store.get("owc-indoor-ts", null);
+let roomContext  = store.get("owc-room-ctx", "closed");        // ac | closed | aired
 let units    = store.get("owc-units", "metric");
 let alertsOn = store.get("owc-alerts", false);
 let forecastView = store.get("owc-forecast", "today");   // 'today' | 'week'
@@ -616,6 +677,7 @@ function render() {
   $("locName").textContent = loc.name;
 
   const outlook = computeOutlook(c);
+  const im = indoorMeta();
   const winAngle = verdict.key==="open"?52:verdict.key==="maybe"?22:0;
 
   /* banner: soonest upcoming good window */
@@ -661,6 +723,7 @@ function render() {
     </div>
   </section>
   <section class="chips">${cur.reasons.slice(0,4).map(r=>`<span class="chip ${r.g?"g":"b"}">${r.g?"✓":"•"} ${esc(r.t)}</span>`).join("")}</section>
+  <div class="assume-row"><button class="assume ${im.stale?"warn":""}" onclick="openSettings()">Indoor ${Math.round(settings.indoorRH)}% RH · ${im.word}</button></div>
   ${banner}
   ${body}
   ${editMode ? "" : `<footer class="ftr"><button class="refresh" onclick="fetchAll()">${loading?"Updating…":"Refresh"}</button><span>Open-Meteo · ${updatedAt?updatedAt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""}</span></footer>`}`;
@@ -682,6 +745,7 @@ function toggleHide(id) {
 }
 window.moveCard = moveCard; window.toggleHide = toggleHide; window.fetchAll = fetchAll;
 window.setForecastView = function(v){ forecastView = v; store.set("owc-forecast", v); if (wx) render(); };
+window.openSettings = function(){ openSheet("settingsSheet"); };
 
 /* ───── unit toggle ───── */
 function syncUnitSeg() {
@@ -730,11 +794,49 @@ $("geoBtn").addEventListener("click", async () => {
   finally { setTimeout(()=>{ $("geoBtn").textContent = "📍 Use my current location"; }, 2500); }
 });
 
-/* ───── settings: sliders, alerts, layout ───── */
-$("tSlider").value = settings.indoorT; $("tVal").textContent = `${tDisp(settings.indoorT)}${tUnit()}`;
-$("hSlider").value = settings.indoorRH; $("hVal").textContent = settings.indoorRH + "%";
-$("tSlider").addEventListener("input", e => { settings.indoorT = parseFloat(e.target.value); $("tVal").textContent = `${tDisp(settings.indoorT)}${tUnit()}`; store.set("owc-settings", settings); if (wx) render(); });
-$("hSlider").addEventListener("input", e => { settings.indoorRH = parseFloat(e.target.value); $("hVal").textContent = settings.indoorRH + "%"; store.set("owc-settings", settings); if (wx) render(); });
+/* ───── settings: indoor humidity engine, alerts, layout ───── */
+function persistIndoor(){ store.set("owc-settings", settings); store.set("owc-indoor-source", indoorSource); store.set("owc-indoor-ts", indoorTs); store.set("owc-room-ctx", roomContext); }
+function refreshIndoorUI(){
+  $("tVal").textContent = `${tDisp(settings.indoorT)}${tUnit()}`;
+  $("hVal").textContent = Math.round(settings.indoorRH) + "%";
+  $("tSlider").value = settings.indoorT; $("hSlider").value = settings.indoorRH;
+  document.querySelectorAll("#ctxSeg button").forEach(b => b.classList.toggle("on", b.dataset.c === roomContext));
+  const m = indoorMeta();
+  const labels = { sensor:"Source: live HomeKit sensor", hygrometer:"Source: your hygrometer reading", modeled:"Source: modeled from outdoor air + room state", default:"Not calibrated yet — pick what your room's doing, or set a hygrometer reading" };
+  $("indoorMetaTxt").textContent = `${Math.round(settings.indoorRH)}% RH · ${m.word}`;
+  $("indoorMeta").title = labels[indoorSource] || "";
+  document.querySelector("#indoorMeta .indoor-dot").style.background = m.tone;
+}
+$("tSlider").value = settings.indoorT;
+$("hSlider").value = settings.indoorRH;
+refreshIndoorUI();
+
+// Room context → immediately model the indoor RH (active choice = recompute, not a surprise)
+document.querySelectorAll("#ctxSeg button").forEach(b => b.addEventListener("click", () => {
+  roomContext = b.dataset.c;
+  const est = modelIndoorRH();
+  if (est != null) { settings.indoorRH = est; indoorSource = "modeled"; indoorTs = Date.now(); }
+  persistIndoor(); refreshIndoorUI(); if (wx) render();
+}));
+// Re-model on demand (e.g. after the weather updates)
+$("estimateBtn").addEventListener("click", () => {
+  const est = modelIndoorRH();
+  if (est == null) return;
+  settings.indoorRH = est; indoorSource = "modeled"; indoorTs = Date.now();
+  persistIndoor(); refreshIndoorUI(); if (wx) render();
+});
+// Temperature: if the number is modeled, keep it consistent; otherwise just set temp
+$("tSlider").addEventListener("input", e => {
+  settings.indoorT = parseFloat(e.target.value);
+  if (indoorSource === "modeled") { const est = modelIndoorRH(); if (est != null) settings.indoorRH = est; }
+  persistIndoor(); refreshIndoorUI(); if (wx) render();
+});
+// Moving the humidity slider = a real reading
+$("hSlider").addEventListener("input", e => {
+  settings.indoorRH = parseFloat(e.target.value);
+  indoorSource = "hygrometer"; indoorTs = Date.now();
+  persistIndoor(); refreshIndoorUI(); if (wx) render();
+});
 
 $("alertTog").checked = alertsOn;
 $("alertTog").addEventListener("change", async e => {
@@ -767,8 +869,10 @@ if (window.OWC_homekitAvailable) {
   $("hkBtn").addEventListener("click", async () => {
     try {
       const r = await window.OWC_readHomeKit();
-      if (r && r.temperature != null) { settings.indoorT = r.temperature; settings.indoorRH = r.humidity; store.set("owc-settings", settings);
-        $("tSlider").value = r.temperature; $("hSlider").value = r.humidity; if (wx) render(); $("hkBtn").textContent = "Synced ✓"; }
+      if (r && r.temperature != null) {
+        settings.indoorT = r.temperature; settings.indoorRH = Math.round(r.humidity);
+        indoorSource = "sensor"; indoorTs = Date.now(); persistIndoor();
+        refreshIndoorUI(); if (wx) render(); $("hkBtn").textContent = "Synced ✓"; }
     } catch {}
   });
 }
